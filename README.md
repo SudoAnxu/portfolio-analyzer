@@ -1,8 +1,4 @@
-Here’s a **README.md** file for your Streamlit-based portfolio analysis tool. It includes installation, usage instructions, and an overview of the features:
 
----
-
-````markdown
 # 📈 Portfolio Analyzer
 
 A Streamlit-based application to analyze equity trading data across multiple years, adjust for stock splits, convert currencies, calculate XIRR, and track portfolio value over time.
@@ -104,6 +100,6 @@ MIT License. Open-source contributions welcome!
 
 Feel free to open an issue or contact me.
 
-```
+
 
 
