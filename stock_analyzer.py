@@ -125,7 +125,7 @@ if uploaded_files and len(uploaded_files) == 3:
                 historical_data[all_tickers[0]] = historical_data_all
 
         unique_symbols = list(historical_data.keys())
-        # --- Display ALL Historical Data (UPDATED ADDITION) ---
+        # --- Display ALL Historical Data  ---
         st.subheader("Historical Price Data for All Holdings")
         
         all_historical_dfs = []
@@ -136,12 +136,12 @@ if uploaded_files and len(uploaded_files) == 3:
         
         if all_historical_dfs:
             combined_historical_df = pd.concat(all_historical_dfs)
-            # Reorder columns to have Ticker first for better readability
+
             cols = ['Ticker'] + [col for col in combined_historical_df.columns if col != 'Ticker']
             st.dataframe(combined_historical_df[cols])
         else:
             st.info("No historical data could be fetched for any of the holdings.")
-        # --- End of UPDATED ADDITION ---
+
         forex_rates = get_historical_forex_yfinance(start_date_for_data, end_date)
 
         combined_df['Date_only'] = combined_df['Date'].dt.date
