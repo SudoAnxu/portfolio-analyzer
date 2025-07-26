@@ -7,15 +7,17 @@ import requests
 
 st.set_page_config(layout="wide", page_title="Portfolio Analysis")
 
-# Function definitions
-
+# ---------------------- Function Definitions ----------------------
 def xirr(cash_flows, dates):
     if len(cash_flows) != len(dates):
         raise ValueError("Cash flows and dates must have the same length.")
+
     dates_series = pd.Series(dates)
     dates_diff = (dates_series - dates_series.iloc[0]).dt.days
+
     def npv_func(rate):
         return sum(cf / (1 + rate)**(d / 365) for cf, d in zip(cash_flows, dates_diff))
+
     try:
         from scipy.optimize import newton
         return newton(npv_func, 0.1)
@@ -32,12 +34,16 @@ def xirr(cash_flows, dates):
 def get_historical_forex_yfinance(start_date, end_date):
     forex_rates = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date))
     forex_rates['USD'] = 1.0
+
     inr_data = yf.download('INR=X', start=start_date, end=end_date, progress=False, auto_adjust=True)
     sgd_data = yf.download('SGD=X', start=start_date, end=end_date, progress=False, auto_adjust=True)
+
     forex_rates['INR'] = inr_data['Close']
     forex_rates['SGD'] = sgd_data['Close']
+
     forex_rates.ffill(inplace=True)
     forex_rates.bfill(inplace=True)
+
     forex_rates = forex_rates.reset_index().rename(columns={'index': 'Date'}).melt(
         id_vars=['Date'], var_name='Currency', value_name='Rate')
     return forex_rates
@@ -59,7 +65,7 @@ def get_latest_news(symbols, api_key):
             latest_news[symbol] = [f"Failed to fetch news: {e}"]
     return latest_news
 
-# --- STREAMLIT UI ---
+# ---------------------- Streamlit UI ----------------------
 st.title("\U0001F4C8 Portfolio Returns & Value Tracker")
 
 uploaded_files = st.file_uploader(
@@ -80,6 +86,7 @@ if uploaded_files and len(uploaded_files) == 3:
         combined_df['Quantity'] = combined_df['Quantity'].astype(str).str.replace(',', '', regex=True).astype(float)
         combined_df['Date'] = pd.to_datetime(combined_df['Date/Time']).dt.tz_localize(None)
         combined_df.drop(columns=['Date/Time', 'Trades', 'Header', 'DataDiscriminator', 'Code', 'MTM P/L', 'Proceeds'], inplace=True, errors='ignore')
+
         combined_df.rename(columns={
             'Asset Category': 'Asset_Category',
             'T. Price': 'Transaction_Price',
@@ -92,7 +99,7 @@ if uploaded_files and len(uploaded_files) == 3:
         st.subheader("\u2705 Adjusting for Stock Splits")
         for symbol in combined_df['Ticker'].unique():
             if symbol.upper() == 'C6L':
-                continue  # skip invalid ticker
+                continue
             try:
                 ticker = yf.Ticker(symbol)
                 splits = ticker.splits
@@ -102,7 +109,7 @@ if uploaded_files and len(uploaded_files) == 3:
                         combined_df.loc[mask, 'Quantity'] *= ratio
                         combined_df.loc[mask, 'Transaction_Price'] /= ratio
             except Exception as e:
-                st.warning(f"\u26A0\ufe0f Failed to fetch split data for {symbol}: {e}")
+                st.warning(f"⚠️ Failed to fetch split data for {symbol}: {e}")
 
         combined_df['Cash_Flow'] = -1 * combined_df['Quantity'] * combined_df['Transaction_Price']
 
@@ -111,7 +118,7 @@ if uploaded_files and len(uploaded_files) == 3:
         start_date_for_data = combined_df['Date'].min().date() - timedelta(days=5)
         end_date = datetime.now().date()
 
-        st.subheader("\U0001F4C9 Fetching Historical Prices")
+        st.subheader("📉 Fetching Historical Prices")
         all_tickers = [sym for sym in unique_symbols if sym.upper() != 'C6L']
         historical_data_all = yf.download(all_tickers, start=start_date_for_data, end=end_date, progress=False, group_by='ticker', auto_adjust=True)
 
@@ -124,19 +131,14 @@ if uploaded_files and len(uploaded_files) == 3:
             if not historical_data_all.empty:
                 historical_data[all_tickers[0]] = historical_data_all
 
-        unique_symbols = list(historical_data.keys())
-        # --- Display ALL Historical Data  ---
-        st.subheader("Historical Price Data for All Holdings")
-        
+        st.subheader("📊 Historical Price Data for All Holdings")
         all_historical_dfs = []
         for symbol, df_data in historical_data.items():
             temp_df = df_data.copy()
             temp_df['Ticker'] = symbol
             all_historical_dfs.append(temp_df)
-        
         if all_historical_dfs:
             combined_historical_df = pd.concat(all_historical_dfs)
-
             cols = ['Ticker'] + [col for col in combined_historical_df.columns if col != 'Ticker']
             st.dataframe(combined_historical_df[cols])
         else:
@@ -146,6 +148,7 @@ if uploaded_files and len(uploaded_files) == 3:
 
         combined_df['Date_only'] = combined_df['Date'].dt.date
         forex_rates['Date_only'] = forex_rates['Date'].dt.date
+
         merged_transactions = pd.merge(combined_df, forex_rates, left_on=['Date_only', 'Currency'], right_on=['Date_only', 'Currency'], how='left')
 
         all_dates = pd.date_range(start=combined_df['Date'].min().date(), end=end_date, freq='D')
@@ -161,27 +164,32 @@ if uploaded_files and len(uploaded_files) == 3:
                         positions[symbol] = 0
                     positions[symbol] += row['Quantity']
 
-            total_value_usd = 0
             for symbol, quantity in positions.items():
-                if quantity != 0:
+                if quantity != 0 and symbol in historical_data:
                     try:
-                        adj_close = historical_data[symbol]['Close'].loc[str(date.date())]
-                        total_value_usd += quantity * adj_close
+                        price = historical_data[symbol]['Close'].loc[str(date.date())]
+                        portfolio_value_df.loc[date, symbol] = quantity * price
                     except KeyError:
                         pass
 
-            for currency in unique_currencies:
-                try:
-                    rate = forex_rates[(forex_rates['Date_only'] == date.date()) & (forex_rates['Currency'] == currency)]['Rate'].iloc[0]
-                    portfolio_value_df.loc[date, currency] = total_value_usd * rate
-                except (IndexError, KeyError):
-                    if date > all_dates[0]:
-                        portfolio_value_df.loc[date, currency] = portfolio_value_df.loc[date - timedelta(days=1), currency]
+        portfolio_value_df['Total Value (USD)'] = portfolio_value_df.sum(axis=1)
 
-        st.subheader("\U0001F4C8 Daily Portfolio Value (in each currency)")
+        st.subheader("📈 Daily Portfolio Value Over Time")
+        st.line_chart(portfolio_value_df['Total Value (USD)'], use_container_width=True)
+
+        st.subheader("🔍 Individual Holding Performance")
+        holding_selected = st.selectbox(
+            "Select a holding to view time series value:",
+            options=[col for col in portfolio_value_df.columns if col != 'Total Value (USD)']
+        )
+
+        holding_series_filled = portfolio_value_df[holding_selected].ffill()
+        st.line_chart(holding_series_filled, use_container_width=True)
+
+        st.subheader("📅 Daily Portfolio Table (USD)")
         st.dataframe(portfolio_value_df.tail(10))
 
-        st.subheader("\U0001F4CA XIRR Per Holding")
+        st.subheader("📊 XIRR Per Holding")
         xirr_results = {}
         for symbol in unique_symbols:
             holding_transactions = combined_df[combined_df['Ticker'] == symbol].copy()
@@ -201,7 +209,7 @@ if uploaded_files and len(uploaded_files) == 3:
                     xirr_results[symbol] = "N/A"
         st.dataframe(pd.DataFrame.from_dict(xirr_results, orient='index', columns=['XIRR (%)']))
 
-        st.subheader("\U0001F4F0 Latest News Headlines (Bonus)")
+        st.subheader("📰 Latest News Headlines")
         finnhub_api_key = st.secrets["FINHUB_API"]
         news = get_latest_news(unique_symbols, finnhub_api_key)
         for symbol, articles in news.items():
@@ -209,4 +217,4 @@ if uploaded_files and len(uploaded_files) == 3:
             for headline in articles:
                 st.markdown(f"- {headline}")
 else:
-    st.info("\U0001F4C2 Please upload **exactly 3 CSV files** (for 2023, 2024, and 2025).")
+    st.info("📂 Please upload **exactly 3 CSV files** (for 2023, 2024, and 2025).")
