@@ -4,20 +4,25 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime, timedelta
 import requests
+from groq import Groq
+import io
+import sys
+import re
 
 st.set_page_config(layout="wide", page_title="Portfolio Analysis")
+
+# --- Initialize Session State Flag ---
+if 'is_data_processed' not in st.session_state:
+    st.session_state.is_data_processed = False
 
 # ---------------------- Function Definitions ----------------------
 def xirr(cash_flows, dates):
     if len(cash_flows) != len(dates):
         raise ValueError("Cash flows and dates must have the same length.")
-
     dates_series = pd.Series(dates)
     dates_diff = (dates_series - dates_series.iloc[0]).dt.days
-
     def npv_func(rate):
         return sum(cf / (1 + rate)**(d / 365) for cf, d in zip(cash_flows, dates_diff))
-
     try:
         from scipy.optimize import newton
         return newton(npv_func, 0.1)
@@ -30,24 +35,18 @@ def xirr(cash_flows, dates):
             else:
                 high = mid
         return (low + high) / 2
-
 def get_historical_forex_yfinance(start_date, end_date):
     forex_rates = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date))
     forex_rates['USD'] = 1.0
-
     inr_data = yf.download('INR=X', start=start_date, end=end_date, progress=False, auto_adjust=True)
     sgd_data = yf.download('SGD=X', start=start_date, end=end_date, progress=False, auto_adjust=True)
-
     forex_rates['INR'] = inr_data['Close']
     forex_rates['SGD'] = sgd_data['Close']
-
     forex_rates.ffill(inplace=True)
     forex_rates.bfill(inplace=True)
-
     forex_rates = forex_rates.reset_index().rename(columns={'index': 'Date'}).melt(
         id_vars=['Date'], var_name='Currency', value_name='Rate')
     return forex_rates
-
 def get_latest_news(symbols, api_key):
     latest_news = {}
     for symbol in symbols:
@@ -65,156 +64,314 @@ def get_latest_news(symbols, api_key):
             latest_news[symbol] = [f"Failed to fetch news: {e}"]
     return latest_news
 
-# ---------------------- Streamlit UI ----------------------
+# ---------------------- Sidebar ----------------------
+with st.sidebar:
+    st.header("💡 Portfolio FAQs")
+    st.markdown("**Q1:** What is XIRR?\n\nAnnualized return considering irregular cash flows.")
+    st.markdown("**Q2:** Why is portfolio value changing?\n\nBecause of price changes, currency rates, and quantity held.")
+    st.markdown("**Q3:** Why is some data missing?\n\nMissing ticker or price history in Yahoo Finance.")
+    st.markdown("**Q4:** How is cash flow calculated?\n\nCash Flow = -1 × Quantity × Transaction Price")
+
+    st.divider()
+
+    if st.button("🔄 Clear Data"):
+        st.session_state.is_data_processed = False
+        st.session_state.pop('combined_df', None)
+        st.session_state.pop('chat_history', None)
+        st.rerun()
+
+    st.divider()
+    st.subheader("🤖 Ask AI About Your Portfolio (ReAct Agent)")
+
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+
+    if not st.session_state.get("is_data_processed", False):
+        st.info("Upload your CSVs to enable the AI chat functionality.")
+    else:
+        user_input = st.text_input("Enter your question", key="chat_input")
+
+        def python_repl_tool(code, df):
+            import io, sys
+            old_stdout = sys.stdout
+            redirected_output = sys.stdout = io.StringIO()
+            try:
+                exec_globals = {'df': df, 'pd': pd, 'np': np}
+                exec(code, exec_globals)
+                output = redirected_output.getvalue().strip()
+            except Exception as e:
+                output = f"Error: {e}"
+            finally:
+                sys.stdout = old_stdout
+            return output
+
+        if user_input:
+            df = st.session_state.combined_df
+            columns = df.columns.tolist()
+
+            system_prompt = f"""
+You are an AI assistant with access to a Python REPL to help analyze a stock portfolio.
+The portfolio data is stored in a pandas DataFrame named `df`.
+IMPORTANT: Use only the following column names: {columns}
+The 'MTM P/L' column is not available, so you cannot reference it.
+
+Here are the rules:
+1. You must use the `python_repl_tool` to get information from the DataFrame.
+2. Output a `Thought`, an `Action`, and the `Action Input`.
+3. The `Action` must be `python_repl_tool`.
+4. The `Action Input` is a valid Python code snippet to be executed.
+5. When you have enough information, output a `Final Answer`.
+6. Your response must be in the following format:
+   Thought: your thought process
+   Action: python_repl_tool
+   Action Input: python code here
+   ... (Observation will be inserted here by the tool)
+   Final Answer: your final answer
+Begin!
+"""
+
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}]
+            full_llm_output = ""
+
+            try:
+                client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+                with st.spinner("Thinking..."):
+                    response_container = st.empty()
+
+                    for _ in range(5):
+                        response_stream = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=messages,
+                            temperature=0,
+                            stream=True,
+                        )
+
+                        full_llm_turn = ""
+                        for chunk in response_stream:
+                            delta = chunk.choices[0].delta.content or ""
+                            full_llm_turn += delta
+                            response_container.markdown(f"**AI (thinking)**:\n{full_llm_turn}")
+
+                        full_llm_output += f"\n\n{full_llm_turn}"
+
+                        action_input_match = re.search(r"Action Input:\s*```python\s*(.*?)\s*```", full_llm_turn, re.DOTALL)
+                        if not action_input_match:
+                            action_input_match = re.search(r"Action Input:\s*(.*)", full_llm_turn, re.DOTALL)
+
+                        if action_input_match:
+                            action_input = action_input_match.group(1).strip()
+                            observation = python_repl_tool(action_input, df)
+                            messages.append({"role": "assistant", "content": full_llm_turn})
+                            messages.append({"role": "user", "content": f"Observation: {observation}"})
+
+                            # Summarize observation
+                            summarized_obs = client.chat.completions.create(
+                                model="llama-3.3-70b-versatile",
+                                messages=[
+                                    {"role": "system", "content": "Summarize the following observation from a Python output into a simple one-line insight for a finance user."},
+                                    {"role": "user", "content": observation}
+                                ],
+                                temperature=0.5
+                            )
+                            summary_text = summarized_obs.choices[0].message.content.strip()
+
+                            # Save to session history
+                            st.session_state.chat_history.append({
+                                "role": "assistant",
+                                "content": f"Thought: {re.search(r'Thought:\s*(.*)', full_llm_turn, re.DOTALL).group(1).strip() if 'Thought:' in full_llm_turn else ''}\n"
+                                           f"Action: python_repl_tool\n"
+                                           f"Action Input:\n```python\n{action_input}\n```\n"
+                                           f"Observation:\n```python\n{observation}\n```\n"
+                                           f"Final Answer: {summary_text}"
+                            })
+
+                            # Display
+                            response_container.markdown(f"**🧠 Thought & Action:**\n```markdown\n{full_llm_turn}\n```\n"
+                                                        f"**📊 Observation:**\n```python\n{observation}\n```")
+                            st.success(f"✅ Final Answer:\n\n{summary_text}")
+                        else:
+                            st.error("❌ Failed to parse LLM action.")
+                            break
+
+                        if "Final Answer:" in full_llm_turn:
+                            break
+
+            except Exception as e:
+                st.error(f"❌ LLM Error: {e}")
+
+    if st.session_state.chat_history:
+        for chat in reversed(st.session_state.chat_history):
+            with st.chat_message(chat['role']):
+                content = chat['content']
+
+                thought_match = re.search(r"Thought:\s*(.*?)\n", content, re.DOTALL)
+                action_match = re.search(r"Action:\s*(.*?)\n", content)
+                action_input_match = re.search(r"Action Input:\s*```python\s*(.*?)```", content, re.DOTALL)
+                observation_match = re.search(r"Observation:\s*```python\s*(.*?)```", content, re.DOTALL)
+                final_answer_match = re.search(r"Final Answer:\s*(.*)", content, re.DOTALL)
+
+                if all([thought_match, action_match, action_input_match, observation_match, final_answer_match]):
+                    st.markdown("🧠 **Thought:**")
+                    st.markdown(thought_match.group(1).strip())
+
+                    st.markdown("🛠️ **Action:**")
+                    st.code(action_match.group(1).strip(), language='text')
+
+                    st.markdown("📥 **Code Executed:**")
+                    st.code(action_input_match.group(1).strip(), language='python')
+
+                    st.markdown("📊 **Observation:**")
+                    st.code(observation_match.group(1).strip())
+
+                    st.markdown("✅ **Final Answer:**")
+                    st.success(final_answer_match.group(1).strip())
+                else:
+                    st.markdown(content)  # fallback
+
+
+
+
+
+# ---------------------- Main Dashboard Logic ----------------------
 st.title("\U0001F4C8 Portfolio Returns & Value Tracker")
 
-uploaded_files = st.file_uploader(
-    "Upload 3 Trade CSVs (one for each year)", type=['csv'], accept_multiple_files=True)
+if not st.session_state.is_data_processed:
+    uploaded_files = st.file_uploader(
+        "Upload 3 Trade CSVs (one for each year)", type=['csv'], accept_multiple_files=True)
 
-if uploaded_files and len(uploaded_files) == 3:
-    with st.spinner("Processing..."):
-        dfs = []
-        for file in uploaded_files:
-            df = pd.read_csv(file)
-            df_filtered = df[df['DataDiscriminator'] == 'Order'].copy()
-            dfs.append(df_filtered)
+    if uploaded_files and len(uploaded_files) == 3:
+        with st.spinner("Processing..."):
+            dfs = []
+            for file in uploaded_files:
+                df = pd.read_csv(file)
+                df_filtered = df[df['DataDiscriminator'] == 'Order'].copy()
+                dfs.append(df_filtered)
+            combined_df = pd.concat(dfs, ignore_index=True)
+            combined_df.dropna(how='all', inplace=True)
+            combined_df.dropna(axis=1, how='all', inplace=True)
+            
+            combined_df['Quantity'] = combined_df['Quantity'].astype(str).str.replace(',', '', regex=True).astype(float)
+            combined_df['Date'] = pd.to_datetime(combined_df['Date/Time']).dt.tz_localize(None)
+            combined_df.drop(columns=['Date/Time', 'Trades', 'Header', 'DataDiscriminator', 'Code', 'MTM P/L', 'Proceeds'], inplace=True, errors='ignore')
+            combined_df.rename(columns={
+                'Asset Category': 'Asset_Category',
+                'T. Price': 'Transaction_Price',
+                'C. Price': 'Closing_Price',
+                'Comm/Fee': 'Commission',
+                'Realized P/L': 'Realized_PL',
+                'Symbol': 'Ticker'
+            }, inplace=True)
 
-        combined_df = pd.concat(dfs, ignore_index=True)
-        combined_df.dropna(how='all', inplace=True)
-        combined_df.dropna(axis=1, how='all', inplace=True)
-
-        combined_df['Quantity'] = combined_df['Quantity'].astype(str).str.replace(',', '', regex=True).astype(float)
-        combined_df['Date'] = pd.to_datetime(combined_df['Date/Time']).dt.tz_localize(None)
-        combined_df.drop(columns=['Date/Time', 'Trades', 'Header', 'DataDiscriminator', 'Code', 'MTM P/L', 'Proceeds'], inplace=True, errors='ignore')
-
-        combined_df.rename(columns={
-            'Asset Category': 'Asset_Category',
-            'T. Price': 'Transaction_Price',
-            'C. Price': 'Closing_Price',
-            'Comm/Fee': 'Commission',
-            'Realized P/L': 'Realized_PL',
-            'Symbol': 'Ticker'
-        }, inplace=True)
-
-        st.subheader("\u2705 Adjusting for Stock Splits")
-        for symbol in combined_df['Ticker'].unique():
-            if symbol.upper() == 'C6L':
-                continue
-            try:
-                ticker = yf.Ticker(symbol)
-                splits = ticker.splits
-                if splits is not None and not splits.empty:
-                    for split_date, ratio in splits.items():
-                        mask = (combined_df['Ticker'] == symbol) & (combined_df['Date'] < pd.Timestamp(split_date.date()))
-                        combined_df.loc[mask, 'Quantity'] *= ratio
-                        combined_df.loc[mask, 'Transaction_Price'] /= ratio
-            except Exception as e:
-                st.warning(f"⚠️ Failed to fetch split data for {symbol}: {e}")
-
-        combined_df['Cash_Flow'] = -1 * combined_df['Quantity'] * combined_df['Transaction_Price']
-
-        unique_symbols = combined_df['Ticker'].unique()
-        unique_currencies = combined_df['Currency'].unique()
-        start_date_for_data = combined_df['Date'].min().date() - timedelta(days=5)
-        end_date = datetime.now().date()
-
-        st.subheader("📉 Fetching Historical Prices")
-        all_tickers = [sym for sym in unique_symbols if sym.upper() != 'C6L']
-        historical_data_all = yf.download(all_tickers, start=start_date_for_data, end=end_date, progress=False, group_by='ticker', auto_adjust=True)
-
-        historical_data = {}
-        if isinstance(historical_data_all.columns, pd.MultiIndex):
-            for symbol in all_tickers:
-                if symbol in historical_data_all.columns.levels[0]:
-                    historical_data[symbol] = historical_data_all[symbol].dropna(how='all')
-        else:
-            if not historical_data_all.empty:
-                historical_data[all_tickers[0]] = historical_data_all
-
-        st.subheader("📊 Historical Price Data for All Holdings")
-        all_historical_dfs = []
-        for symbol, df_data in historical_data.items():
-            temp_df = df_data.copy()
-            temp_df['Ticker'] = symbol
-            all_historical_dfs.append(temp_df)
-        if all_historical_dfs:
-            combined_historical_df = pd.concat(all_historical_dfs)
-            cols = ['Ticker'] + [col for col in combined_historical_df.columns if col != 'Ticker']
-            st.dataframe(combined_historical_df[cols])
-        else:
-            st.info("No historical data could be fetched for any of the holdings.")
-
-        forex_rates = get_historical_forex_yfinance(start_date_for_data, end_date)
-
-        combined_df['Date_only'] = combined_df['Date'].dt.date
-        forex_rates['Date_only'] = forex_rates['Date'].dt.date
-
-        merged_transactions = pd.merge(combined_df, forex_rates, left_on=['Date_only', 'Currency'], right_on=['Date_only', 'Currency'], how='left')
-
-        all_dates = pd.date_range(start=combined_df['Date'].min().date(), end=end_date, freq='D')
-        portfolio_value_df = pd.DataFrame(index=all_dates)
-        positions = {}
-
-        for date in all_dates:
-            daily_transactions = merged_transactions[merged_transactions['Date_only'] == date.date()]
-            for _, row in daily_transactions.iterrows():
-                symbol = row['Ticker']
-                if symbol in historical_data:
-                    if symbol not in positions:
-                        positions[symbol] = 0
-                    positions[symbol] += row['Quantity']
-
-            for symbol, quantity in positions.items():
-                if quantity != 0 and symbol in historical_data:
-                    try:
-                        price = historical_data[symbol]['Close'].loc[str(date.date())]
-                        portfolio_value_df.loc[date, symbol] = quantity * price
-                    except KeyError:
-                        pass
-
-        portfolio_value_df['Total Value (USD)'] = portfolio_value_df.sum(axis=1)
-
-        st.subheader("📈 Daily Portfolio Value Over Time")
-        st.line_chart(portfolio_value_df['Total Value (USD)'], use_container_width=True)
-
-        st.subheader("🔍 Individual Holding Performance")
-        holding_selected = st.selectbox(
-            "Select a holding to view time series value:",
-            options=[col for col in portfolio_value_df.columns if col != 'Total Value (USD)']
-        )
-
-        holding_series_filled = portfolio_value_df[holding_selected].ffill()
-        st.line_chart(holding_series_filled, use_container_width=True)
-
-        st.subheader("📅 Daily Portfolio Table (USD)")
-        st.dataframe(portfolio_value_df.tail(10))
-
-        st.subheader("📊 XIRR Per Holding")
-        xirr_results = {}
-        for symbol in unique_symbols:
-            holding_transactions = combined_df[combined_df['Ticker'] == symbol].copy()
-            if not holding_transactions.empty and symbol in historical_data:
+            st.subheader("\u2705 Adjusting for Stock Splits")
+            for symbol in combined_df['Ticker'].unique():
+                if symbol.upper() == 'C6L':
+                    continue
                 try:
-                    latest_price = historical_data[symbol]['Close'].iloc[-1]
-                    latest_date = historical_data[symbol].index[-1]
-                    final_quantity = holding_transactions['Quantity'].sum()
-                    final_cash_flow_row = {
-                        'Date': latest_date,
-                        'Cash_Flow': final_quantity * latest_price
-                    }
-                    cash_flows_df = pd.concat([holding_transactions[['Date', 'Cash_Flow']], pd.DataFrame([final_cash_flow_row])], ignore_index=True)
-                    xirr_val = xirr(cash_flows_df['Cash_Flow'].tolist(), cash_flows_df['Date'].tolist())
-                    xirr_results[symbol] = f"{xirr_val * 100:.2f}%"
-                except (ValueError, IndexError):
-                    xirr_results[symbol] = "N/A"
-        st.dataframe(pd.DataFrame.from_dict(xirr_results, orient='index', columns=['XIRR (%)']))
+                    ticker = yf.Ticker(symbol)
+                    splits = ticker.splits
+                    if splits is not None and not splits.empty:
+                        for split_date, ratio in splits.items():
+                            mask = (combined_df['Ticker'] == symbol) & (combined_df['Date'] < pd.Timestamp(split_date.date()))
+                            combined_df.loc[mask, 'Quantity'] *= ratio
+                            combined_df.loc[mask, 'Transaction_Price'] /= ratio
+                except Exception as e:
+                    st.warning(f"⚠️ Failed to fetch split data for {symbol}: {e}")
+            combined_df['Cash_Flow'] = -1 * combined_df['Quantity'] * combined_df['Transaction_Price']
 
-        st.subheader("📰 Latest News Headlines")
-        finnhub_api_key = st.secrets["FINHUB_API"]
-        news = get_latest_news(unique_symbols, finnhub_api_key)
-        for symbol, articles in news.items():
-            st.markdown(f"**{symbol}**")
-            for headline in articles:
-                st.markdown(f"- {headline}")
+            st.session_state.combined_df = combined_df.copy()
+            st.session_state.is_data_processed = True
+            st.rerun()
+    else:
+        st.info("📂 Please upload **exactly 3 CSV files** (for 2023, 2024, and 2025).")
+
 else:
-    st.info("📂 Please upload **exactly 3 CSV files** (for 2023, 2024, and 2025).")
+    combined_df = st.session_state.combined_df
+    
+    unique_symbols = combined_df['Ticker'].unique()
+    unique_currencies = combined_df['Currency'].unique()
+    start_date_for_data = combined_df['Date'].min().date() - timedelta(days=5)
+    end_date = datetime.now().date()
+    
+    st.subheader("📉 Fetching Historical Prices")
+    all_tickers = [sym for sym in unique_symbols if sym.upper() != 'C6L']
+    historical_data_all = yf.download(all_tickers, start=start_date_for_data, end=end_date, progress=False, group_by='ticker', auto_adjust=True)
+    historical_data = {}
+    if isinstance(historical_data_all.columns, pd.MultiIndex):
+        for symbol in all_tickers:
+            if symbol in historical_data_all.columns.levels[0]:
+                historical_data[symbol] = historical_data_all[symbol].dropna(how='all')
+    else:
+        if not historical_data_all.empty:
+            historical_data[all_tickers[0]] = historical_data_all
+    st.subheader("📊 Historical Price Data for All Holdings")
+    all_historical_dfs = []
+    for symbol, df_data in historical_data.items():
+        temp_df = df_data.copy()
+        temp_df['Ticker'] = symbol
+        all_historical_dfs.append(temp_df)
+    if all_historical_dfs:
+        combined_historical_df = pd.concat(all_historical_dfs)
+        cols = ['Ticker'] + [col for col in combined_historical_df.columns if col != 'Ticker']
+        st.dataframe(combined_historical_df[cols])
+    else:
+        st.info("No historical data could be fetched for any of the holdings.")
+    forex_rates = get_historical_forex_yfinance(start_date_for_data, end_date)
+    combined_df['Date_only'] = combined_df['Date'].dt.date
+    forex_rates['Date_only'] = forex_rates['Date'].dt.date
+    merged_transactions = pd.merge(combined_df, forex_rates, left_on=['Date_only', 'Currency'], right_on=['Date_only', 'Currency'], how='left')
+    all_dates = pd.date_range(start=combined_df['Date'].min().date(), end=end_date, freq='D')
+    portfolio_value_df = pd.DataFrame(index=all_dates)
+    positions = {}
+    for date in all_dates:
+        daily_transactions = merged_transactions[merged_transactions['Date_only'] == date.date()]
+        for _, row in daily_transactions.iterrows():
+            symbol = row['Ticker']
+            if symbol in historical_data:
+                if symbol not in positions:
+                    positions[symbol] = 0
+                positions[symbol] += row['Quantity']
+        for symbol, quantity in positions.items():
+            if quantity != 0 and symbol in historical_data:
+                try:
+                    price = historical_data[symbol]['Close'].loc[str(date.date())]
+                    portfolio_value_df.loc[date, symbol] = quantity * price
+                except KeyError:
+                    pass
+    portfolio_value_df['Total Value (USD)'] = portfolio_value_df.sum(axis=1)
+    st.subheader("📈 Daily Portfolio Value Over Time")
+    st.line_chart(portfolio_value_df['Total Value (USD)'], use_container_width=True)
+    st.subheader("🔍 Individual Holding Performance")
+    holding_selected = st.selectbox(
+        "Select a holding to view time series value:",
+        options=[col for col in portfolio_value_df.columns if col != 'Total Value (USD)']
+    )
+    holding_series_filled = portfolio_value_df[holding_selected].ffill()
+    st.line_chart(holding_series_filled, use_container_width=True)
+    st.subheader("📅 Daily Portfolio Table (USD)")
+    st.dataframe(portfolio_value_df.tail(10))
+    st.subheader("📊 XIRR Per Holding")
+    xirr_results = {}
+    for symbol in unique_symbols:
+        holding_transactions = combined_df[combined_df['Ticker'] == symbol].copy()
+        if not holding_transactions.empty and symbol in historical_data:
+            try:
+                latest_price = historical_data[symbol]['Close'].iloc[-1]
+                latest_date = historical_data[symbol].index[-1]
+                final_quantity = holding_transactions['Quantity'].sum()
+                final_cash_flow_row = {
+                    'Date': latest_date,
+                    'Cash_Flow': final_quantity * latest_price
+                }
+                cash_flows_df = pd.concat([holding_transactions[['Date', 'Cash_Flow']], pd.DataFrame([final_cash_flow_row])], ignore_index=True)
+                xirr_val = xirr(cash_flows_df['Cash_Flow'].tolist(), cash_flows_df['Date'].tolist())
+                xirr_results[symbol] = f"{xirr_val * 100:.2f}%"
+            except (ValueError, IndexError):
+                xirr_results[symbol] = "N/A"
+    st.dataframe(pd.DataFrame.from_dict(xirr_results, orient='index', columns=['XIRR (%)']))
+    st.subheader("📰 Latest News Headlines")
+    finnhub_api_key = st.secrets["FINHUB_API"]
+    news = get_latest_news(unique_symbols, finnhub_api_key)
+    for symbol, articles in news.items():
+        st.markdown(f"**{symbol}**")
+        for headline in articles:
+            st.markdown(f"- {headline}")
