@@ -341,10 +341,16 @@ else:
         for symbol, quantity in positions.items():
             if quantity != 0 and symbol in historical_data:
                 try:
-                    price = historical_data[symbol]['Close'].loc[str(date.date())]
+                    # Ensure continuous date index and forward-fill missing prices
+                    close_series = historical_data[symbol]['Close']
+                    full_index = pd.date_range(start=portfolio_value_df.index.min(), end=portfolio_value_df.index.max(), freq='D')
+                    close_series = close_series.reindex(full_index).ffill().fillna(0)
+
+                    price = close_series.loc[date]
                     portfolio_value_df.loc[date, symbol] = quantity * price
                 except KeyError:
                     pass
+
     portfolio_value_df['Total Value (USD)'] = portfolio_value_df.sum(axis=1)
     st.subheader("📈 Daily Portfolio Value Over Time")
     st.line_chart(portfolio_value_df['Total Value (USD)'], use_container_width=True)
