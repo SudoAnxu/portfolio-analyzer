@@ -140,102 +140,110 @@ Begin!
 
             messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}]
             full_llm_output = ""
+            if user_input:
+                # Save user input to chat history
+                st.session_state.chat_history.append({
+                    "role": "user",
+                    "content": user_input
+                    })
 
-            try:
-                client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-                with st.spinner("Thinking..."):
-                    response_container = st.empty()
+                messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}]
+                full_llm_output = ""
 
-                    for _ in range(5):
-                        response_stream = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
-                            messages=messages,
-                            temperature=0,
-                            stream=True,
-                        )
+                try:
+                    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+                    with st.spinner("Thinking..."):
+                        response_container = st.empty()
 
-                        full_llm_turn = ""
-                        for chunk in response_stream:
-                            delta = chunk.choices[0].delta.content or ""
-                            full_llm_turn += delta
-                            response_container.markdown(f"**AI (thinking)**:\n{full_llm_turn}")
-
-                        full_llm_output += f"\n\n{full_llm_turn}"
-
-                        action_input_match = re.search(r"Action Input:\s*```python\s*(.*?)\s*```", full_llm_turn, re.DOTALL)
-                        if not action_input_match:
-                            action_input_match = re.search(r"Action Input:\s*(.*)", full_llm_turn, re.DOTALL)
-
-                        if action_input_match:
-                            action_input = action_input_match.group(1).strip()
-                            observation = python_repl_tool(action_input, df)
-                            messages.append({"role": "assistant", "content": full_llm_turn})
-                            messages.append({"role": "user", "content": f"Observation: {observation}"})
-
-                            # Summarize observation
-                            summarized_obs = client.chat.completions.create(
+                        for _ in range(5):
+                            response_stream = client.chat.completions.create(
                                 model="llama-3.3-70b-versatile",
-                                messages=[
-                                    {"role": "system", "content": "Summarize the following observation from a Python output into a simple one-line insight for a finance user."},
-                                    {"role": "user", "content": observation}
-                                ],
-                                temperature=0.5
+                                messages=messages,
+                                temperature=0,
+                                stream=True,
                             )
-                            summary_text = summarized_obs.choices[0].message.content.strip()
+        
+                            full_llm_turn = ""
+                            for chunk in response_stream:
+                                delta = chunk.choices[0].delta.content or ""
+                                full_llm_turn += delta
+                                response_container.markdown(f"**AI (thinking)**:\n{full_llm_turn}")
 
-                            # Save to session history
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": f"Thought: {re.search(r'Thought:\s*(.*)', full_llm_turn, re.DOTALL).group(1).strip() if 'Thought:' in full_llm_turn else ''}\n"
-                                           f"Action: python_repl_tool\n"
-                                           f"Action Input:\n```python\n{action_input}\n```\n"
-                                           f"Observation:\n```python\n{observation}\n```\n"
-                                           f"Final Answer: {summary_text}"
-                            })
+                            full_llm_output += f"\n\n{full_llm_turn}"
 
-                            # Display
-                            response_container.markdown(f"**🧠 Thought & Action:**\n```markdown\n{full_llm_turn}\n```\n"
-                                                        f"**📊 Observation:**\n```python\n{observation}\n```")
-                            st.success(f"✅ Final Answer:\n\n{summary_text}")
-                        else:
-                            st.error("❌ Failed to parse LLM action.")
-                            break
+                            # Parse the action input
+                            action_input_match = re.search(r"Action Input:\s*```python\s*(.*?)\s*```", full_llm_turn, re.DOTALL)
+                            if not action_input_match:
+                                action_input_match = re.search(r"Action Input:\s*(.*)", full_llm_turn, re.DOTALL)
 
-                        if "Final Answer:" in full_llm_turn:
-                            break
+                            if action_input_match:
+                                action_input = action_input_match.group(1).strip()
+                                observation = python_repl_tool(action_input, df)
 
-            except Exception as e:
-                st.error(f"❌ LLM Error: {e}")
+                                # Add full turn and observation to message stack
+                                messages.append({"role": "assistant", "content": full_llm_turn})
+                                messages.append({"role": "user", "content": f"Observation: {observation}"})
 
-    if st.session_state.chat_history:
-        for chat in reversed(st.session_state.chat_history):
-            with st.chat_message(chat['role']):
-                content = chat['content']
+                                # Summarize observation
+                                summarized_obs = client.chat.completions.create(
+                                    model="llama-3.3-70b-versatile",
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": f"Summarize the following observation from a Python output into a meaningful insight for a finance user, aligned with User input: {user_input}"
+                                        },
+                                        {"role": "user", "content": observation}
+                                        ],
+                                    temperature=0.1
+                                )
+                                summary_text = summarized_obs.choices[0].message.content.strip()
 
-                thought_match = re.search(r"Thought:\s*(.*?)\n", content, re.DOTALL)
-                action_match = re.search(r"Action:\s*(.*?)\n", content)
-                action_input_match = re.search(r"Action Input:\s*```python\s*(.*?)```", content, re.DOTALL)
-                observation_match = re.search(r"Observation:\s*```python\s*(.*?)```", content, re.DOTALL)
-                final_answer_match = re.search(r"Final Answer:\s*(.*)", content, re.DOTALL)
+                                # Save assistant turn to chat history
+                                st.session_state.chat_history.append({
+                                    "role": "assistant",
+                                    "thought": re.search(r"Thought:\s*(.*)", full_llm_turn, re.DOTALL).group(1).strip() if 'Thought:' in full_llm_turn else '',
+                                    "action": "python_repl_tool",
+                                    "action_input": action_input,
+                                    "observation": observation,
+                                    "final_answer": summary_text
+                                })
 
-                if all([thought_match, action_match, action_input_match, observation_match, final_answer_match]):
-                    st.markdown("🧠 **Thought:**")
-                    st.markdown(thought_match.group(1).strip())
+                                    # Display current turn
+                                with st.expander("Thought: "):
+                                    st.markdown(f"**🧠 Thought & Action:**\n```markdown\n{full_llm_turn}\n```\n"
+                                    f"**📊 Observation:**\n```python\n{observation}\n```")
+                                st.success(f"✅ Final Answer:\n\n{summary_text}")
+                            else:
+                                st.error("❌ Failed to parse LLM action.")
+                                break
 
-                    st.markdown("🛠️ **Action:**")
-                    st.code(action_match.group(1).strip(), language='text')
+                            if "Final Answer:" in full_llm_turn:
+                                break
 
-                    st.markdown("📥 **Code Executed:**")
-                    st.code(action_input_match.group(1).strip(), language='python')
+                except Exception as e:
+                    st.error(f"❌ LLM Error: {e}")
 
-                    st.markdown("📊 **Observation:**")
-                    st.code(observation_match.group(1).strip())
+            # Replay the conversation
+            if st.session_state.chat_history:
+                for chat in reversed(st.session_state.chat_history):
+                    with st.chat_message(chat['role']):
+                        if chat["role"] == "assistant" and all(k in chat for k in ["thought", "action", "action_input", "observation", "final_answer"]):
+                            st.markdown("✅ **Final Answer:**")
+                            st.success(chat["final_answer"])
+                            with st.expander("🧠 Show Thought Process & Actions"):
+                                st.markdown("**🧠 Thought:**")
+                                st.markdown(chat["thought"])
 
-                    st.markdown("✅ **Final Answer:**")
-                    st.success(final_answer_match.group(1).strip())
-                else:
-                    st.markdown(content)  # fallback
+                                st.markdown("**🛠️ Action:**")
+                                st.code(chat["action"], language="text")
 
+                                st.markdown("**📥 Code Executed:**")
+                                st.code(chat["action_input"], language="python")
+
+                                st.markdown("**📊 Observation:**")
+                                st.code(chat["observation"])
+                        elif chat["role"] == "user":
+                            st.markdown(f"**You:** {chat['content']}")
 
 
 
