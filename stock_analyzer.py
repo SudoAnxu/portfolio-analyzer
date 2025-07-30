@@ -255,7 +255,7 @@ if not st.session_state.is_data_processed:
     uploaded_files = st.file_uploader(
         "Upload 3 Trade CSVs (one for each year)", type=['csv'], accept_multiple_files=True)
 
-    if uploaded_files and len(uploaded_files) == 3:
+    if uploaded_files and len(uploaded_files) >=1 :
         with st.spinner("Processing..."):
             dfs = []
             for file in uploaded_files:
@@ -298,7 +298,7 @@ if not st.session_state.is_data_processed:
             st.session_state.is_data_processed = True
             st.rerun()
     else:
-        st.info("📂 Please upload **exactly 3 CSV files** (for 2023, 2024, and 2025).")
+        st.info("📂 Please upload a CSV file")
 
 else:
     combined_df = st.session_state.combined_df
